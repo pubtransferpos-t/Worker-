@@ -1,4 +1,4 @@
-// Cloudflare Worker: password-protected message mailboxes.
+// Cloudflare Worker: password-protected message mailboxes (zero-knowledge version).
 // Uses ONLY default Worker settings - no KV namespace, no secrets, no
 // wrangler.toml changes needed. Just paste this into the dashboard editor
 // (or wrangler deploy with a plain wrangler.toml) and it works.
@@ -10,22 +10,41 @@
 // a personal low-traffic tool this works fine. If you ever want guaranteed
 // durability, swapping this for a KV namespace binding is a quick upgrade.
 //
+// SECURITY MODEL (changed from the original version):
+// The client (messenger.cpp) never sends your password to this Worker.
+// Instead it locally derives two independent values from the password
+// using PBKDF2:
+//   - a "lookup key" (a random-looking hex string) used only to address
+//     the mailbox
+//   - an "encryption key" (never transmitted at all) used to encrypt the
+//     message with AES-256-GCM before it ever leaves the client
+// This Worker therefore only ever sees the lookup key and an opaque
+// ciphertext blob. It cannot recover your password or read your messages,
+// and neither can anyone who gains read access to the cache.
+//
 // IMPORTANT: change PEPPER below to your own random string before deploying.
-// It's mixed into password hashing so mailbox keys can't be reverse-engineered.
+// It adds a second hashing step server-side as defense in depth (it does
+// NOT protect the plaintext password/message - the client-side design
+// above is what does that).
 //
 // API:
-//   POST /send     { "password": "...", "message": "..." }  -> { ok: true }
-//   POST /receive  { "password": "..." }                     -> { messages: [{text, ts}, ...] }
-//   (receiving clears the mailbox for that password)
+//   POST /send     { "key": "<64 hex chars>", "message": "<base64 ciphertext>" } -> { ok: true }
+//   POST /receive  { "key": "<64 hex chars>" }  -> { messages: [{text, ts}, ...] }
+//   (receiving clears the mailbox for that key; "text" is ciphertext, decrypt client-side)
 
 const PEPPER = "change-me-to-your-own-random-string-9f8x2q";
 
 const MAX_ATTEMPTS = 5;             // requests allowed per IP...
 const WINDOW_SECONDS = 300;         // ...per this many seconds
 const MESSAGE_TTL_SECONDS = 604800; // messages auto-expire after 7 days
-const MAX_MESSAGES_PER_BOX = 50;    // cap stored messages per password
-const MAX_MESSAGE_LENGTH = 2000;
-const MIN_PASSWORD_LENGTH = 4;
+const MAX_MESSAGES_PER_BOX = 50;    // cap stored messages per mailbox
+const MAX_MESSAGE_LENGTH = 4000;    // base64 ciphertext is bigger than the
+                                     // original plaintext (iv + tag + b64
+                                     // overhead), so this is larger than
+                                     // the old MAX_MESSAGE_LENGTH of 2000
+const LOOKUP_KEY_LENGTH = 64;       // hex-encoded 32-byte PBKDF2 output
+
+const LOOKUP_KEY_RE = /^[0-9a-f]{64}$/;
 
 export default {
   async fetch(request) {
@@ -104,11 +123,16 @@ async function checkRateLimit(cache, ip) {
   return true;
 }
 
-// ---- Password hashing ----
+// ---- Storage-path hashing ----
+// This hashes the already-derived lookup key with a server-side pepper
+// before using it as a cache path. It's defense in depth (obscures the
+// raw lookup key even from someone reading cache keys directly) - it is
+// NOT what keeps your password/messages private. That protection comes
+// from the client never sending the password or plaintext message at all.
 
-async function hashPassword(password) {
+async function hashKey(lookupKey) {
   const enc = new TextEncoder();
-  const data = enc.encode(PEPPER + password);
+  const data = enc.encode(PEPPER + lookupKey);
   const digest = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(digest)]
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -129,11 +153,11 @@ async function handleSend(request, cache, ip) {
     return json({ error: "Invalid JSON" }, 400);
   }
 
-  const { password, message } = body || {};
+  const { key, message } = body || {};
 
-  if (typeof password !== "string" || password.length < MIN_PASSWORD_LENGTH) {
+  if (typeof key !== "string" || !LOOKUP_KEY_RE.test(key)) {
     return json(
-      { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` },
+      { error: `key must be a ${LOOKUP_KEY_LENGTH}-character hex string` },
       400
     );
   }
@@ -147,8 +171,8 @@ async function handleSend(request, cache, ip) {
     );
   }
 
-  const hash = await hashPassword(password);
-  const path = `/msgs/${hash}`;
+  const hashed = await hashKey(key);
+  const path = `/msgs/${hashed}`;
 
   const existingRaw = await cacheGet(cache, path);
   const existing = existingRaw ? JSON.parse(existingRaw) : [];
@@ -173,13 +197,16 @@ async function handleReceive(request, cache, ip) {
     return json({ error: "Invalid JSON" }, 400);
   }
 
-  const { password } = body || {};
-  if (typeof password !== "string" || password.length === 0) {
-    return json({ error: "Password required" }, 400);
+  const { key } = body || {};
+  if (typeof key !== "string" || !LOOKUP_KEY_RE.test(key)) {
+    return json(
+      { error: `key must be a ${LOOKUP_KEY_LENGTH}-character hex string` },
+      400
+    );
   }
 
-  const hash = await hashPassword(password);
-  const path = `/msgs/${hash}`;
+  const hashed = await hashKey(key);
+  const path = `/msgs/${hashed}`;
 
   const raw = await cacheGet(cache, path);
   const messages = raw ? JSON.parse(raw) : [];
