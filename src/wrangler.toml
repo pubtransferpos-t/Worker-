@@ -1,3 +1,24 @@
-name = "hello-world-worker"
+name = "worker-re"
 main = "index.js"
-compatibility_date = "2026-08-13"
+compatibility_date = "2024-09-23"
+
+# Durable Object bindings - required by index.js.
+# Mailbox = one instance per lookup key, stores that mailbox's messages.
+# RateLimiter = one instance per client IP, stores its request counter.
+[[durable_objects.bindings]]
+name = "MAILBOX"
+class_name = "Mailbox"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+# Required the first time you introduce Durable Object classes.
+# Uses the newer SQLite storage backend (Cloudflare's current default).
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Mailbox", "RateLimiter"]
+
+# Set the pepper as a real secret rather than the hardcoded fallback
+# in index.js:
+#   wrangler secret put PEPPER
